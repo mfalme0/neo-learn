@@ -1,0 +1,161 @@
+# Neo Learn CI
+#
+# Go tests need a real Postgres and Redis: the behaviour under test is ON
+# CONFLICT semantics and transaction boundaries, which a fake cannot
+# reproduce. Both are therefore service containers rather than mocks.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref rather than queueing them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Matches .env.example and docker-compose.yml. The host port is 5433 because
+  # 5432 is often taken by a local Postgres.
+  DATABASE_URL: postgres://neolearn:neolearn@localhost:5433/neolearn?sslmode=disable
+  REDIS_ADDR: localhost:6379
+
+jobs:
+  go:
+    name: Go (build, vet, test)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: neolearn
+          POSTGRES_PASSWORD: neolearn
+          POSTGRES_DB: neolearn
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U neolearn -d neolearn"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          # Matches CGO_ENABLED=1 in the race step below.
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l -s .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Test with race detector
+        # CGO is required for -race and is not the default on some runners.
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./... -count=1 -race
+
+      - name: Migrations apply and roll back cleanly
+        # A migration that only works forwards is a latent outage. Both
+        # directions are exercised against a real database.
+        run: |
+          go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+          migrate -path db/migrations -database "$DATABASE_URL" up
+          migrate -path db/migrations -database "$DATABASE_URL" down 1
+          migrate -path db/migrations -database "$DATABASE_URL" up
+          migrate -path db/migrations -database "$DATABASE_URL" version
+
+      - name: sqlc is up to date
+        # Fails if db/queries drifted from the generated Go, which would
+        # otherwise only surface on the next person's machine.
+        run: |
+          go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+          sqlc generate
+          if ! git diff --quiet -- internal/db; then
+            echo "internal/db is stale. Run 'make sqlc' and commit the result."
+            git diff --stat -- internal/db
+            exit 1
+          fi
+
+  web:
+    name: Web (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.11'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        # `npm ci` requires the lockfile to be in step with package.json.
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npx eslint .
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  secrets:
+    # Fails the build if a credential is committed. Cheap, and a leaked key
+    # in git history is permanent regardless of a later removal.
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan tracked files for credentials
+        run: |
+          patterns='ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-[A-Za-z0-9]{32,}'
+          if git grep -nEI "$patterns" -- . ':!*.md'; then
+            echo "A credential pattern matched a tracked file. Rotate it if real."
+            exit 1
+          fi
+          echo "No credential patterns found in tracked files."

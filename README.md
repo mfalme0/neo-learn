@@ -305,13 +305,15 @@ The learning session never broke. The interface simply changed.
 The stack is deliberately less important than keeping the learning engine
 independent of the transport mechanism.
 
+As built so far:
+
 | Layer | Choice |
 | --- | --- |
-| Frontend | React / Next.js, TypeScript, PWA capabilities, IndexedDB for offline state |
-| Backend | Go or Python, REST API |
-| Data | PostgreSQL, Redis for queues and transient state |
-| Messaging | SMS gateway, SIM Toolkit integration, message queue for async delivery |
-| Infrastructure | Docker, CI/CD, Linux, cloud or self-hosted deployment |
+| Frontend | Next.js 15, React 19, TypeScript (strict), Tailwind, Vitest |
+| Backend | Go 1.27, `net/http` + chi |
+| Data | PostgreSQL 17, sqlc-typed queries, golang-migrate, Redis for sessions |
+| Messaging | *planned* — SMS gateway, SIM Toolkit, outbox worker |
+| Infrastructure | Docker Compose, Makefile |
 
 ---
 
@@ -320,17 +322,21 @@ independent of the transport mechanism.
 The initial versions focus on proving the core architecture rather than shipping a
 complete LMS.
 
-**Phase 1 — Core Platform**
-Authentication, student accounts, courses, lessons, assessments, progress tracking,
-basic teacher dashboard.
+**Phase 1 — Core Platform** · *in progress*
+Authentication, student accounts, courses, lessons, assessments, and progress
+tracking are built and tested. The teacher dashboard is not.
+
+**Phase 1.5 — Synchronization** · *partly built*
+The offline queue and the cross-transport event model are in place ahead of
+their original position, because the SMS worker depends on both. Native app
+packaging and service-worker caching are not.
 
 **Phase 2 — SMS**
 Lesson delivery, SMS assessments, response processing, delivery tracking, message
 queue, retry handling.
 
-**Phase 3 — Synchronization**
-Offline application, local state, sync queue, conflict handling, cross-channel
-progress synchronization.
+**Phase 3 — Synchronization** · *superseded by 1.5*
+Offline state, the sync queue, and conflict handling shipped with Phase 1.5.
 
 **Phase 4 — SIM Toolkit**
 STK interaction, menu-based navigation, assessment interaction, account lookup,
@@ -375,11 +381,81 @@ multi-tenant SaaS design, educational content management, and responsive design.
 
 ## Status
 
-**Under active design. Experimental / side project.**
+**Milestone 1 in progress. Experimental / side project.**
 
-Neo Learn is a practical exploration of resilient EdTech infrastructure with
-particular attention to low-connectivity environments and multi-channel learning
-experiences. There is no working implementation yet.
+What runs today:
+
+- **Learning engine** — an append-only event log is the source of truth; progress is a projection of it. A single `UNIQUE (event_id)` constraint is what makes a duplicated action a no-op, whether it came from a double-click, an offline queue replay, or a learner texting the same answer twice.
+- **REST API** — auth, courses, lessons, assessments, progress, and `POST /v1/events` as the single write path for learner state.
+- **Web client** — sign in, dashboard, lesson view, and an assessment surface that shows the server's verdict. Holds an offline queue in `localStorage`; answers survive a lost connection.
+- **Tests** — integration tests against real Postgres and Redis, plus 54 frontend tests.
+
+What does not exist yet: the SMS and STK transports, and the teacher and
+administrator interfaces. The `outbox` table is written on every event but
+nothing drains it — that is milestone 2.
+
+See [`docs/architecture.md`](docs/architecture.md) for why the system is shaped
+this way, including the alternatives that were rejected.
+
+---
+
+## Getting Started
+
+Requires Go 1.27, Node 20.11+, and Docker Desktop.
+
+```bash
+# 1. Start Postgres (host port 5433) and Redis (6379)
+make up
+
+# 2. Apply migrations
+make migrate
+
+# 3. Seed a development institution, course, and assessment
+go run ./cmd/seed
+
+# 4. Start the API on :8080
+make run
+
+# 5. Start the web client on :3000, in another shell
+make web-install
+make web-dev
+```
+
+Sign in at `http://localhost:3000/login` with the credentials printed by the
+seed command. `joseph.learner@example.test` has a phone number attached and is
+the account to use when testing SMS delivery later.
+
+Run the tests:
+
+```bash
+make test          # Go integration tests
+make web-install && cd web && npm test
+```
+
+Go tests skip rather than fail when Postgres and Redis are unreachable, so
+`go test ./...` still works without Docker.
+
+---
+
+## Repository Layout
+
+```text
+cmd/api            HTTP server
+cmd/seed           development fixtures
+db/migrations      golang-migrate, up/down pairs
+db/queries         SQL, type-checked against the schema by sqlc
+internal/db        generated: models and typed queries
+internal/learning  the engine — knows nothing about HTTP, SMS, or STK
+internal/auth      argon2id hashing, Redis sessions
+internal/httpapi   REST transport
+internal/store     connection pool
+web/               Next.js learner interface
+docs/              architecture decisions
+```
+
+`internal/learning` is the boundary that matters. It accepts a learner action
+and applies it to learner state; it has no transport awareness. Adding SMS means
+calling `Ingest`, not changing anything in there.
 
 ## License
 
