@@ -98,7 +98,10 @@ func RequireSession(sessions *auth.SessionStore) func(http.Handler) http.Handler
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), sessionContextKey, sess)
+			// &sess is required: sessionFromContext asserts on *auth.Session. Storing
+			// the value rather than a pointer would make every authenticated
+			// request silently unauthenticated.
+			ctx := context.WithValue(r.Context(), sessionContextKey, &sess)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

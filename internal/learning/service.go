@@ -164,13 +164,10 @@ func NewService(pool *pgxpool.Pool, queries *db.Queries) *Service {
 // Idempotent on EventID. A duplicate returns Result{Duplicate: true} and
 // changes nothing, so a learner who answers twice is scored once.
 func (s *Service) Ingest(ctx context.Context, ev Event) (Result, error) {
-	if err := ev.validate(); err != nil {
+	ev, err := ev.normalized()
+	if err != nil {
 		return Result{}, err
 	}
-	if ev.OccurredAt.IsZero() {
-		ev.OccurredAt = time.Now().UTC()
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Result{}, fmt.Errorf("learning: begin transaction: %w", err)
@@ -181,6 +178,9 @@ func (s *Service) Ingest(ctx context.Context, ev Event) (Result, error) {
 
 	queries := s.queries.WithTx(tx)
 
+	// ON CONFLICT (event_id) DO NOTHING makes this the idempotency gate. A
+	// conflicting insert returns no row, which pgx surfaces as ErrNoRows --
+	// that, not a returned zero id, is the duplicate signal.
 	inserted, err := queries.InsertLearningEvent(ctx, db.InsertLearningEventParams{
 		EventID:       uuidParam(ev.EventID),
 		InstitutionID: ev.InstitutionID,
@@ -194,18 +194,22 @@ func (s *Service) Ingest(ctx context.Context, ev Event) (Result, error) {
 		Payload:       []byte(ev.Payload),
 		OccurredAt:    ev.OccurredAt,
 	})
-	if err != nil {
-		return Result{}, fmt.Errorf("learning: insert event: %w", err)
-	}
-
-	if inserted.ID == 0 {
-		// ON CONFLICT DO NOTHING returned no row: we have seen this event
-		// before. The projection already reflects it.
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// We have seen this event before. The projection already reflects it,
+		// so returning here without touching progress is the entire
+		// idempotency contract.
 		//
-		// Returning Duplicate without touching progress is the whole
-		// idempotency contract. Note this does not re-send a notification,
-		// so a duplicate SMS does not produce a second acknowledgement --
-		// which is exactly what the learner who pressed "send" twice wants.
+		// Note this also skips enqueueing a notification, so a duplicate SMS
+		// does not produce a second acknowledgement -- which is what a learner
+		// who pressed "send" twice actually wants.
+		return Result{EventID: ev.EventID, Duplicate: true}, nil
+	case err != nil:
+		return Result{}, fmt.Errorf("learning: insert event: %w", err)
+	case inserted.ID == 0:
+		// Defensive: a RETURNING clause that produced a row should have an
+		// id. Treat a missing one as a duplicate rather than projecting
+		// against an unrecorded event.
 		return Result{EventID: ev.EventID, Duplicate: true}, nil
 	}
 
@@ -364,51 +368,70 @@ func (s *Service) enqueueNotification(ctx context.Context, queries *db.Queries, 
 // validate enforces the invariants the ingest path depends on. It rejects
 // events that could not be projected rather than storing something the
 // projection cannot represent.
-func (ev Event) validate() error {
+//
+// It returns the normalised event rather than mutating the receiver, so the
+// caller cannot accidentally ingest a partly-defaulted event.
+func (ev Event) normalized() (Event, error) {
 	if ev.EventID == uuid.Nil {
-		return ErrEventIDRequired
-	}
-	if ev.InstitutionID <= 0 {
-		return ErrLearnerRequired
+		return Event{}, ErrEventIDRequired
 	}
 	if ev.LearnerID <= 0 {
-		return ErrLearnerRequired
+		return Event{}, ErrLearnerRequired
+	}
+	// Institution is derived from the authenticated session rather than from
+	// the client, so a missing value is a programming error, not bad input.
+	if ev.InstitutionID <= 0 {
+		return Event{}, fmt.Errorf("learning: institution_id must be set on the event")
 	}
 	if ev.Kind == "" {
-		return ErrKindRequired
+		return Event{}, ErrKindRequired
 	}
 	if !ev.Kind.IsValid() {
-		return ErrKindInvalid
+		return Event{}, ErrKindInvalid
 	}
 	if ev.Source == "" {
 		ev.Source = SourceWeb
 	}
 	if !ev.Source.IsValid() {
-		return ErrSourceInvalid
+		return Event{}, ErrSourceInvalid
+	}
+	if ev.OccurredAt.IsZero() {
+		ev.OccurredAt = time.Now().UTC()
 	}
 
 	switch ev.Kind {
 	case KindQuestionAnswered:
 		if ev.QuestionID == nil {
-			return ErrQuestionRequired
+			return Event{}, ErrQuestionRequired
 		}
 		var p AnswerPayload
-		if len(ev.Payload) == 0 {
-			return ErrChoiceRequired
-		}
 		if err := json.Unmarshal(ev.Payload, &p); err != nil {
-			return ErrChoiceRequired
+			return Event{}, ErrChoiceRequired
 		}
 		if strings.TrimSpace(p.ChoiceLabel) == "" {
-			return ErrChoiceRequired
+			return Event{}, ErrChoiceRequired
 		}
+		// Normalise the label so "b", " B ", and "B" grade identically. An
+		// SMS reply is exactly the case where this matters.
+		p.ChoiceLabel = strings.ToUpper(strings.TrimSpace(p.ChoiceLabel))
+		payload, err := json.Marshal(p)
+		if err != nil {
+			return Event{}, fmt.Errorf("learning: encode answer payload: %w", err)
+		}
+		ev.Payload = payload
 	case KindLessonStarted, KindLessonCompleted:
 		if ev.LessonID == nil {
-			return ErrLessonRequired
+			return Event{}, ErrLessonRequired
 		}
 	}
 
-	return nil
+	// payload is NOT NULL in the schema; default a missing one so lesson
+	// events need not invent a body.
+	if len(ev.Payload) == 0 {
+		ev.Payload = json.RawMessage("{}")
+	}
+
+	return ev, nil
 }
 
 func uuidParam(id uuid.UUID) pgtype.UUID {

@@ -143,17 +143,39 @@ SELECT
     COALESCE(scored.correct, 0)
 FROM assessments a
 LEFT JOIN LATERAL (
+    -- Recomputed from the log on every ingest, rather than incremented.
+    --
+    -- DISTINCT ON collapses a re-answered question to a single answer.
+    -- Without it, answering the same question correctly twice would count two
+    -- marks for one question.
+    --
+    -- Ordered by occurred_at, not received_at. This matters: an offline queue
+    -- can replay events in the wrong order, so a stale answer may arrive last.
+    -- Ranking by arrival would let the stale answer overwrite the newer one.
+    -- occurred_at is the learner's clock and reflects intent; received_at only
+    -- reflects when the network delivered it. id DESC breaks ties for
+    -- same-microsecond events.
+    --
+    -- correctness comes from the choice matching the label actually picked,
+    -- never from the question row.
     SELECT
-        COUNT(*) FILTER (WHERE qc.is_correct)                        AS correct,
-        COUNT(DISTINCT ev.question_id)                              AS answered,
-        COALESCE(SUM(q.marks) FILTER (WHERE qc.is_correct), 0)      AS marks_awarded
-    FROM learning_events ev
-    JOIN questions qc ON qc.id = ev.question_id
-    JOIN choices ch ON ch.question_id = ev.question_id
-                    AND ch.label = ev.payload ->> 'choice_label'
-    WHERE ev.learner_id = @learner_id
-      AND ev.question_id IN (SELECT id FROM questions WHERE assessment_id = a.id)
-      AND ev.kind = 'question_answered'
+        COUNT(*) FILTER (WHERE ch.is_correct)                   AS correct,
+        COUNT(*)                                                AS answered,
+        COALESCE(SUM(q.marks) FILTER (WHERE ch.is_correct), 0)  AS marks_awarded
+    FROM (
+        SELECT DISTINCT ON (ev.question_id)
+            ev.question_id,
+            ev.payload ->> 'choice_label' AS label
+        FROM learning_events ev
+        WHERE ev.learner_id = @learner_id
+          AND ev.kind = 'question_answered'
+          AND ev.question_id IN (SELECT id FROM questions WHERE assessment_id = a.id)
+        ORDER BY ev.question_id, ev.occurred_at DESC, ev.id DESC
+    ) latest
+    JOIN questions q ON q.id = latest.question_id
+    JOIN choices ch
+      ON ch.question_id = latest.question_id
+     AND ch.label = latest.label
 ) scored ON true
 WHERE a.id = @assessment_id
   AND a.institution_id = @institution_id
