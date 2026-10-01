@@ -1,0 +1,47 @@
+# Neo Learn -- local development infrastructure.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose ps
+#   docker compose down          # stop, keep data
+#   docker compose down -v       # stop, delete data
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: neo-learn-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: neolearn
+      POSTGRES_PASSWORD: neolearn
+      POSTGRES_DB: neolearn
+      # Deterministic collation so ORDER BY on text is stable across machines.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    # Host 5433 rather than 5432: another project's Postgres may already hold
+    # the default. Change this if 5433 is taken too.
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neolearn -d neolearn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: neo-learn-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
+    driver: local
