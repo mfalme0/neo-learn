@@ -19,9 +19,28 @@ type Querier interface {
 	// incremented, which keeps the projection consistent even if a learner
 	// re-answers the same question through a second device.
 	ApplyAnswerToProgress(ctx context.Context, arg ApplyAnswerToProgressParams) (ApplyAnswerToProgressRow, error)
+	// Used by the seed command to assert the "exactly one correct answer" rule
+	// that a partial unique index cannot express.
+	CountChoicesForQuestion(ctx context.Context, questionID int64) (CountChoicesForQuestionRow, error)
+	CountCourses(ctx context.Context, institutionID int64) (int64, error)
+	CountInstitutions(ctx context.Context) (int64, error)
+	CreateAssessment(ctx context.Context, arg CreateAssessmentParams) (CreateAssessmentRow, error)
+	CreateChoice(ctx context.Context, arg CreateChoiceParams) (CreateChoiceRow, error)
+	CreateCourse(ctx context.Context, arg CreateCourseParams) (CreateCourseRow, error)
+	// Authoring queries.
+	//
+	// Not exercised by the API in milestone 1: there is no teacher interface yet.
+	// They exist so the schema can be exercised end-to-end by the seed command and
+	// so the next milestone adds endpoints rather than starting from scratch.
+	CreateInstitution(ctx context.Context, arg CreateInstitutionParams) (CreateInstitutionRow, error)
+	CreateLesson(ctx context.Context, arg CreateLessonParams) (CreateLessonRow, error)
+	CreateModule(ctx context.Context, arg CreateModuleParams) (CreateModuleRow, error)
+	CreateQuestion(ctx context.Context, arg CreateQuestionParams) (CreateQuestionRow, error)
+	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
 	// Written in the same transaction as the event, so state and notification
 	// cannot diverge. Nothing reads this table until milestone 2.
 	EnqueueOutbox(ctx context.Context, arg EnqueueOutboxParams) (int64, error)
+	EnrolLearner(ctx context.Context, arg EnrolLearnerParams) (int64, error)
 	GetAssessmentProgress(ctx context.Context, arg GetAssessmentProgressParams) (GetAssessmentProgressRow, error)
 	GetAssessmentWithQuestions(ctx context.Context, arg GetAssessmentWithQuestionsParams) ([]GetAssessmentWithQuestionsRow, error)
 	// Returns the choice matching a label, used to grade a submitted answer.
