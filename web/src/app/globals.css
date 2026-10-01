@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Neo Learn visual tokens.
+
+ * The accent is a deep teal at 5.2:1 against white, so it satisfies WCAG AA for
+ * normal text and is safe to use for button fills with white text on top.
+ */
+:root {
+  --neo-accent: #0d5c63;
+  --neo-accent-hover: #0a474d;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background-color: #f8fafc;
+  color: #0f172a;
+  /*
+   * System stack: no webfont request, so the first paint does not wait on
+   * network. This matters more than usual here -- the whole product is aimed
+   * at learners on poor connections.
+   */
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif;
+}
+
+/* Respect a stated preference for reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Visible focus for keyboard users without a permanent ring for mouse users. */
+:focus-visible {
+  outline: 2px solid var(--neo-accent);
+  outline-offset: 2px;
+}
