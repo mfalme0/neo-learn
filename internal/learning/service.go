@@ -425,6 +425,20 @@ func (ev Event) normalized() (Event, error) {
 		}
 	}
 
+	// An event naming a target that is not set is rejected rather than stored.
+	// Storing it would leave an event in the log that the projection cannot
+	// interpret, and rebuild-from-log would then be unsound.
+	switch ev.Kind {
+	case KindQuestionAnswered:
+		if ev.AssessmentID == nil && ev.QuestionID == nil {
+			return Event{}, ErrQuestionRequired
+		}
+	case KindAssessmentSubmitted:
+		if ev.AssessmentID == nil {
+			return Event{}, fmt.Errorf("learning: assessment_id is required for %s", ev.Kind)
+		}
+	}
+
 	// payload is NOT NULL in the schema; default a missing one so lesson
 	// events need not invent a body.
 	if len(ev.Payload) == 0 {

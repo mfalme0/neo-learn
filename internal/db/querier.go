@@ -6,6 +6,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
@@ -19,11 +21,42 @@ type Querier interface {
 	// incremented, which keeps the projection consistent even if a learner
 	// re-answers the same question through a second device.
 	ApplyAnswerToProgress(ctx context.Context, arg ApplyAnswerToProgressParams) (ApplyAnswerToProgressRow, error)
+	// Outbox drain queries for the SMS worker.
+	//
+	// The worker is the first reader of the table written in milestone 1. It
+	// follows the transactional outbox pattern: rows are claimed with a short lock,
+	// attempted, then either marked delivered or released with a backoff.
+	// Takes a batch of messages that are due for a delivery attempt.
+	//
+	// FOR UPDATE SKIP LOCKED is what makes multiple workers safe. Without it two
+	// workers would read the same row and send the message twice -- and since SMS
+	// is a real cost per message, that is not an acceptable failure mode.
+	//
+	// A row is due when it is undelivered, not dead, and next_attempt_at has
+	// passed. A stale claim is reclaimable after `stale_after`: a worker killed
+	// mid-attempt must not strand its messages forever.
+	ClaimDueOutboxRows(ctx context.Context, arg ClaimDueOutboxRowsParams) ([]ClaimDueOutboxRowsRow, error)
+	// Marks a single row claimed. Separate from ClaimDueOutboxRows so the lock is
+	// taken only after the batch is known, keeping the transaction short.
+	ClaimOutboxRow(ctx context.Context, id int64) (ClaimOutboxRowRow, error)
+	// Returns a conversation to idle, clearing the pending target.
+	//
+	// The CHECK constraint requires the pending columns to be NULL in the idle and
+	// completed states, so this cannot be done by updating state alone.
+	CloseSmsConversation(ctx context.Context, arg CloseSmsConversationParams) error
 	// Used by the seed command to assert the "exactly one correct answer" rule
 	// that a partial unique index cannot express.
 	CountChoicesForQuestion(ctx context.Context, questionID int64) (CountChoicesForQuestionRow, error)
+	// Used to decide whether an assessment is finished: every question answered
+	// correctly, not merely attempted.
+	CountCorrectAnswers(ctx context.Context, arg CountCorrectAnswersParams) (CountCorrectAnswersRow, error)
 	CountCourses(ctx context.Context, institutionID int64) (int64, error)
+	// Used by the delivery scheduler to decide whether an SMS push is worth
+	// attempting for an enrolled learner.
+	CountEnrolledWithMSISDN(ctx context.Context, institutionID int64) (int64, error)
 	CountInstitutions(ctx context.Context) (int64, error)
+	// Used by the health endpoint to surface a backed-up queue.
+	CountUndeliveredOutbox(ctx context.Context) (CountUndeliveredOutboxRow, error)
 	CreateAssessment(ctx context.Context, arg CreateAssessmentParams) (CreateAssessmentRow, error)
 	CreateChoice(ctx context.Context, arg CreateChoiceParams) (CreateChoiceRow, error)
 	CreateCourse(ctx context.Context, arg CreateCourseParams) (CreateCourseRow, error)
@@ -41,10 +74,17 @@ type Querier interface {
 	// cannot diverge. Nothing reads this table until milestone 2.
 	EnqueueOutbox(ctx context.Context, arg EnqueueOutboxParams) (int64, error)
 	EnrolLearner(ctx context.Context, arg EnrolLearnerParams) (int64, error)
+	GetAssessmentForSms(ctx context.Context, arg GetAssessmentForSmsParams) (GetAssessmentForSmsRow, error)
 	GetAssessmentProgress(ctx context.Context, arg GetAssessmentProgressParams) (GetAssessmentProgressRow, error)
 	GetAssessmentWithQuestions(ctx context.Context, arg GetAssessmentWithQuestionsParams) ([]GetAssessmentWithQuestionsRow, error)
 	// Returns the choice matching a label, used to grade a submitted answer.
 	GetChoiceForQuestion(ctx context.Context, arg GetChoiceForQuestionParams) (GetChoiceForQuestionRow, error)
+	// The correct answer for a question.
+	//
+	// Read only to explain an incorrect reply. This is never projected into a
+	// question prompt: doing so would put the answer key in the message the learner
+	// sees before answering.
+	GetCorrectChoiceLabel(ctx context.Context, arg GetCorrectChoiceLabelParams) (string, error)
 	GetCourse(ctx context.Context, arg GetCourseParams) (GetCourseRow, error)
 	// Lesson totals and mark totals are computed in independent LATERAL
 	// subqueries on purpose.
@@ -54,15 +94,44 @@ type Querier interface {
 	// the assessment totals three times and the SUM would triple. Subqueries keep
 	// each total independent.
 	GetCourseProgress(ctx context.Context, arg GetCourseProgressParams) ([]GetCourseProgressRow, error)
+	GetFirstUnansweredLesson(ctx context.Context, arg GetFirstUnansweredLessonParams) (GetFirstUnansweredLessonRow, error)
 	GetInstitutionByID(ctx context.Context, id int64) (GetInstitutionByIDRow, error)
 	GetInstitutionBySlug(ctx context.Context, slug string) (GetInstitutionBySlugRow, error)
+	// SMS conversation and inbound-routing queries.
+	//
+	// Everything here exists to answer one question: a reply arrives carrying only
+	// a phone number and some text, and we have to work out what it means.
+	// Every institution a number is registered at.
+	//
+	// Returns a list rather than a single row on purpose. A human can legitimately
+	// be a learner at two schools, and silently picking one would let a reply be
+	// applied to the wrong tenant's records. The inbound path treats more than one
+	// row as unresolvable.
+	GetInstitutionsForMSISDN(ctx context.Context, msisdn *string) ([]int64, error)
 	// Which label the learner submitted for a question, used to render a
 	// previously-answered state.
 	GetLearnerAnswer(ctx context.Context, arg GetLearnerAnswerParams) (GetLearnerAnswerRow, error)
 	GetLearnerMSISDN(ctx context.Context, arg GetLearnerMSISDNParams) (*string, error)
 	GetLesson(ctx context.Context, arg GetLessonParams) (GetLessonRow, error)
+	GetLessonForSms(ctx context.Context, arg GetLessonForSmsParams) (GetLessonForSmsRow, error)
 	GetLessonProgress(ctx context.Context, arg GetLessonProgressParams) (GetLessonProgressRow, error)
+	// Finds the question after `after_position` that the learner has not answered
+	// correctly yet.
+	//
+	// Correctly, not merely answered: a learner who answered wrong should see the
+	// question again with feedback rather than having it marked done. `limit` keeps
+	// the query cheap regardless of assessment size.
+	GetNextUnansweredQuestion(ctx context.Context, arg GetNextUnansweredQuestionParams) (GetNextUnansweredQuestionRow, error)
+	// Matches an inbound delivery report to the row that produced it. Some
+	// gateways report delivery long after the send, so this lookup may be the only
+	// way to tie the two together.
+	GetOutboxByProviderMessageID(ctx context.Context, providerMessageID *string) (GetOutboxByProviderMessageIDRow, error)
+	GetOutboxRow(ctx context.Context, id int64) (GetOutboxRowRow, error)
+	// Fetches everything needed to render one question as text, including whether
+	// the learner already got it right.
+	GetQuestionForSms(ctx context.Context, arg GetQuestionForSmsParams) (GetQuestionForSmsRow, error)
 	GetQuestionMarks(ctx context.Context, arg GetQuestionMarksParams) (GetQuestionMarksRow, error)
+	GetSmsConversation(ctx context.Context, arg GetSmsConversationParams) (GetSmsConversationRow, error)
 	// Neo Learn read queries.
 	//
 	// Every query is institution-scoped. There is no query in this file that
@@ -70,6 +139,13 @@ type Querier interface {
 	// a cross-tenant data leak.
 	GetUserByEmail(ctx context.Context, arg GetUserByEmailParams) (GetUserByEmailRow, error)
 	GetUserByID(ctx context.Context, arg GetUserByIDParams) (GetUserByIDRow, error)
+	// Inbound routing: turns the sender number into a learner.
+	//
+	// Scoped by institution because the same human can be a student at two
+	// schools, and an answer must be applied to the right one. The caller learns
+	// the institution from the sender id the gateway was configured with, not from
+	// anything the message body contains.
+	GetUserByMSISDN(ctx context.Context, arg GetUserByMSISDNParams) (GetUserByMSISDNRow, error)
 	// Learning event ingest and progress projection.
 	//
 	// The idempotency guarantee lives in InsertLearningEvent's ON CONFLICT
@@ -79,16 +155,59 @@ type Querier interface {
 	InsertLearningEvent(ctx context.Context, arg InsertLearningEventParams) (InsertLearningEventRow, error)
 	InsertSession(ctx context.Context, arg InsertSessionParams) (int64, error)
 	IsEnrolled(ctx context.Context, arg IsEnrolledParams) (bool, error)
+	// Whether an event id has already been recorded.
+	//
+	// Checked at the very start of inbound handling. The event id is derived from
+	// the provider's message id, so this identifies a gateway retry before any
+	// routing happens.
+	//
+	// It matters that the check comes first: by the time a retry is routed, the
+	// conversation may have advanced or closed, and routing a retry against stale
+	// state produces a confusing reply rather than a silent success.
+	LearningEventExists(ctx context.Context, eventID pgtype.UUID) (bool, error)
 	ListAssessmentsForCourse(ctx context.Context, arg ListAssessmentsForCourseParams) ([]ListAssessmentsForCourseRow, error)
+	// Assessments a learner can be messaged about. Used by the delivery scheduler
+	// to decide what to send next.
+	ListAssessmentsForSms(ctx context.Context, arg ListAssessmentsForSmsParams) ([]ListAssessmentsForSmsRow, error)
 	// is_correct is projected but the HTTP layer must never send it to a learner
 	// before submission. See httpapi.writeProgress.
 	ListChoicesForAssessment(ctx context.Context, arg ListChoicesForAssessmentParams) ([]ListChoicesForAssessmentRow, error)
+	// Returns every choice with its label and body. Whether one is correct is
+	// resolved server-side by the learning engine, never here: the rendering layer
+	// must not be able to leak the answer key into a message.
+	ListChoicesForSms(ctx context.Context, arg ListChoicesForSmsParams) ([]ListChoicesForSmsRow, error)
 	ListEnrolledCourses(ctx context.Context, arg ListEnrolledCoursesParams) ([]ListEnrolledCoursesRow, error)
 	// Returns one flat, ordered list; the service groups it in memory. A flat
 	// query avoids the row-multiplication a nested rows.Cursor would produce
 	// across the modules/lessons cross product.
 	ListModulesWithLessons(ctx context.Context, arg ListModulesWithLessonsParams) ([]ListModulesWithLessonsRow, error)
+	// Records a successful send along with the provider's own id, so a late
+	// delivery report can be matched back to this row.
+	//
+	// The provider id is nullable because the Sender interface does not surface
+	// one for every provider; when absent the row still records that it went out.
+	MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error
+	// Returns a failed message to the queue with a backoff.
+	//
+	// `next_attempt_at` is computed by the caller and passed in, so the backoff
+	// policy lives in Go where it is testable rather than being scattered across
+	// SQL.
+	//
+	// dead_at is passed as a nullable timestamptz rather than a boolean + now(), so
+	// codegen produces a plain pgtype.Timestamptz the caller can set to NULL
+	// explicitly. An unset dead_at is indistinguishable from "not dead", which is
+	// what makes the partial index on dead_at work.
+	//
+	// claimed_at is cleared so another worker can pick the row up immediately.
+	ReleaseOutboxRow(ctx context.Context, arg ReleaseOutboxRowParams) error
+	// Operator action: put dead messages back in the queue after investigating.
+	// Not exposed over HTTP yet; it is destructive and deserves a deliberate UI.
+	RequeueDeadOutbox(ctx context.Context, id int64) (int64, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
+	// Honours a STOP immediately. The inbound path checks this before sending
+	// anything, so opt-out takes effect on the next message rather than the next
+	// enrolment.
+	SetSmsOptOut(ctx context.Context, arg SetSmsOptOutParams) error
 	// Records activity for audit. Best-effort: a failure to update this row must
 	// never fail a login.
 	TouchSession(ctx context.Context, tokenHash string) error
@@ -103,6 +222,13 @@ type Querier interface {
 	// against a course it does not own, and the learner should not have to know
 	// the course id to complete a lesson.
 	UpsertLessonProgress(ctx context.Context, arg UpsertLessonProgressParams) (UpsertLessonProgressRow, error)
+	// Creates or updates the conversation's pending target.
+	//
+	// ON CONFLICT covers the (institution_id, learner_id) unique index, so one
+	// conversation exists per learner per institution. pending_position and
+	// pending_total are refreshed because an assessment may be re-sent after new
+	// questions are added.
+	UpsertSmsConversation(ctx context.Context, arg UpsertSmsConversationParams) (UpsertSmsConversationRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

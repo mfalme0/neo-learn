@@ -221,6 +221,22 @@ WHERE id = $1
   AND institution_id = $2
   AND msisdn IS NOT NULL;
 
+-- name: LearningEventExists :one
+-- Whether an event id has already been recorded.
+--
+-- Checked at the very start of inbound handling. The event id is derived from
+-- the provider's message id, so this identifies a gateway retry before any
+-- routing happens.
+--
+-- It matters that the check comes first: by the time a retry is routed, the
+-- conversation may have advanced or closed, and routing a retry against stale
+-- state produces a confusing reply rather than a silent success.
+SELECT EXISTS (
+    SELECT 1
+    FROM learning_events
+    WHERE event_id = $1
+);
+
 -- name: IsEnrolled :one
 SELECT EXISTS (
     SELECT 1

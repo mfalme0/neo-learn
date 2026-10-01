@@ -250,15 +250,129 @@ that status is carried in text and not only in colour.
 
 ---
 
+---
+
+## Inbound idempotency comes from derivation, not generation
+
+A gateway retries webhook deliveries. The same reply can arrive two or three
+times, and each arrival is a fresh HTTP request with no memory of the last.
+
+So the event id is **derived** from the provider's own message id:
+
+```go
+InboundEventID(providerMessageID, institutionID)  // UUID v5 over a fixed namespace
+```
+
+Deriving rather than generating is the entire mechanism. A generated UUID would
+be unique on every arrival, so every retry would be scored as a fresh answer.
+
+The derivation is checked at the very start of `Processor.Handle`, *before*
+routing, via `LearningEventExists`. Ordering matters: by the time a retry is
+routed, the conversation may have advanced or closed, and routing against stale
+state produces a confusing "not understood" reply rather than a silent success.
+A duplicate is dropped silently -- no second reply, because the learner already
+got one and a second message costs money.
+
+The `UNIQUE` constraint on `learning_events.event_id` remains the real
+enforcement. The early check is an optimisation that avoids work and produces a
+cleaner log line; two concurrent retries still record once because the index
+holds.
+
+## SMS conversation state is transport state, not learning state
+
+`sms_conversations` holds what was *asked*, not what was *answered*. Answers live
+in `learning_events` and are never duplicated here.
+
+This split is deliberate. The event log records what happened; it cannot answer
+"what did this learner last receive", because a question that was sent and never
+answered produced no event at all. Copying answers into this table would create
+a second source of truth free to disagree with the log.
+
+A `CHECK` constraint keeps the pending columns consistent with the state
+discriminator, so `idle` and `completed` cannot retain a dangling question.
+
+## Retries stop for a reason
+
+The drain worker distinguishes failure modes that look similar but must not be
+treated the same:
+
+| Outcome | Retried? | Why |
+| --- | --- | --- |
+| Gateway unavailable | yes, exponential backoff | transient |
+| 5xx | yes | transient |
+| Provider rejection | **never** | the number is refused; retrying burns money and keeps texting somebody who asked to stop |
+| Render declined | **never** | a message that cannot be rendered never will be |
+| Give-up threshold reached | **never** | `dead_at` is set; the row becomes visible to an operator |
+
+Backoff is exponential and **capped**. The cap matters more than the shape: a
+message that failed five times because the provider was down has to come back
+when the provider recovers. An uncapped curve leaves it retried tomorrow.
+
+`FOR UPDATE SKIP LOCKED` is what makes concurrent workers safe. SMS costs money
+per message, so a double send is a real defect rather than a cosmetic one.
+
+## Chunking respects the UCS-2 boundary
+
+GSM-7 holds 160 characters; anything outside that alphabet -- all emoji and most
+non-Latin scripts -- drops to 70. A Swahili or Amharic lesson body that "fits"
+the GSM limit silently bills as twice the segments.
+
+`Chunk` detects the alphabet and applies the correct limit, then splits on
+whitespace so a formula is never cut mid-token. A single token longer than a
+segment is hard-split, because the alternative is a rejected send.
+
+## Opt-out is checked before sending, not before enrolling
+
+A learner who texts `STOP` is recorded in `sms_conversations.opted_out`, and the
+delivery planner checks that flag before rendering anything. Checking only at
+enrolment time would keep sending until their next enrolment -- exactly the
+failure that makes an opt-out feel meaningless.
+
+`SetSmsOptOut` also clears any pending question and returns the conversation to
+`idle`, so an opt-out mid-assessment stops immediately.
+
+## The webhook is authenticated, not open
+
+The inbound endpoint cannot hold a session cookie, so it authenticates with a
+shared secret -- either directly in a header, or as an HMAC over the raw body
+plus a timestamp.
+
+The HMAC form is replay-resistant: an old timestamp is refused, because a
+replayed webhook is the one thing the signature scheme exists to prevent. A
+replay would not double-score anyway -- the derived event id handles that -- but
+refusing it is still correct.
+
+**With no secret configured the route is not mounted at all.** An unauthenticated
+write path should not exist and merely reject requests; a caller probing for the
+endpoint gets a 404.
+
+A missing provider message id is treated as unusable and acknowledged rather than
+retried. Without it there is no way to deduplicate a retry, and silently
+accepting one would let a duplicated delivery score a learner twice.
+
 ## Known gaps and deliberate omissions
 
-- **No SMS or STK transport yet.** `outbox` is written but nothing drains it.
-  That is milestone 2.
+- **No SIM Toolkit transport.** Phase 4. `sms.Gateway` is the seam it plugs
+  into, but STK is a different bearer model -- no HTTP webhook, no gateway retry
+  semantics -- and will need its own inbound path.
+- **No delivery-report reconciliation.** `provider_message_id` is stored and
+  indexed so a late report can be matched, but no endpoint receives reports yet.
+  A send marked delivered locally could still be undelivered by the carrier.
 - **No teacher or admin interface.** The schema supports them; the authoring
-  queries exist; there are no endpoints. Educators landing in the web app get
-  an explicit "not built yet" page rather than an empty dashboard.
+  queries exist; there are no endpoints. Educators landing in the web app get an
+  explicit "not built yet" page rather than an empty dashboard.
+- **Acknowledgements are sent inline, not queued.** An inbound reply is computed
+  and handed to the gateway directly, because `outbox.event_id` carries a
+  foreign key to `learning_events` and inventing a fake event to carry it would
+  weaken that invariant. The cost is real: a reply lost to a gateway blip is not
+  retried. The fix is a separate acknowledgements table, deferred until a real
+  provider makes the trade-off concrete. This is a known gap, not a finished
+  design.
+- **No delivery scheduler.** The worker drains the outbox and the planner decides
+  what a notification means, but nothing yet decides *when to open* an SMS
+  session -- the "you have not completed today's lesson" nudge.
 - **No rebuild tool for the projection.** Because the log is authoritative,
-  `RebuildProgress` is straightforward to add and is deliberately absent — it
+  `RebuildProgress` is straightforward to add and is deliberately absent -- it
   would be untested code pretending to be a safety net.
 - **Choice labels are single uppercase letters.** A `CHAR(1)` constraint,
   because the label has to survive being the entire contents of a text message.

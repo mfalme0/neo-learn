@@ -331,9 +331,12 @@ The offline queue and the cross-transport event model are in place ahead of
 their original position, because the SMS worker depends on both. Native app
 packaging and service-worker caching are not.
 
-**Phase 2 — SMS**
-Lesson delivery, SMS assessments, response processing, delivery tracking, message
-queue, retry handling.
+**Phase 2 — SMS** · *built, no live provider yet*
+Lesson delivery, SMS assessments, response processing, delivery tracking, the
+outbox drain worker, and retry handling are implemented and tested. The outbound
+gateway is a logging stub; a real provider means implementing `sms.Gateway`.
+Still missing: delivery-report reconciliation and the scheduler that decides
+*when* to open an SMS session.
 
 **Phase 3 — Synchronization** · *superseded by 1.5*
 Offline state, the sync queue, and conflict handling shipped with Phase 1.5.
@@ -381,18 +384,24 @@ multi-tenant SaaS design, educational content management, and responsive design.
 
 ## Status
 
-**Milestone 1 in progress. Experimental / side project.**
+**Milestones 1 and 2 built. Experimental / side project.**
 
 What runs today:
 
 - **Learning engine** — an append-only event log is the source of truth; progress is a projection of it. A single `UNIQUE (event_id)` constraint is what makes a duplicated action a no-op, whether it came from a double-click, an offline queue replay, or a learner texting the same answer twice.
 - **REST API** — auth, courses, lessons, assessments, progress, and `POST /v1/events` as the single write path for learner state.
 - **Web client** — sign in, dashboard, lesson view, and an assessment surface that shows the server's verdict. Holds an offline queue in `localStorage`; answers survive a lost connection.
+- **SMS delivery** — an outbox drain worker with exponential backoff, GSM-7/UCS-2 chunking, terminal-vs-retryable failure handling, and opt-out. Inbound replies arrive at a shared-secret-authenticated webhook and are resolved to a learner by sender number, then become ordinary learning events.
 - **Tests** — integration tests against real Postgres and Redis, plus 54 frontend tests.
 
-What does not exist yet: the SMS and STK transports, and the teacher and
-administrator interfaces. The `outbox` table is written on every event but
-nothing drains it — that is milestone 2.
+What does not exist yet: the SIM Toolkit transport, delivery-report
+reconciliation, the SMS delivery *scheduler* (nothing decides when to open an
+SMS session), and the teacher and administrator interfaces.
+
+The outbound gateway is a **logging implementation**, not a real provider. It
+records what would have been sent and accepts injected failures, so the retry
+paths are exercised without paying for messages. Adding a real provider means
+implementing `sms.Gateway` and nothing else.
 
 See [`docs/architecture.md`](docs/architecture.md) for why the system is shaped
 this way, including the alternatives that were rejected.
@@ -440,12 +449,15 @@ Go tests skip rather than fail when Postgres and Redis are unreachable, so
 ## Repository Layout
 
 ```text
-cmd/api            HTTP server
+cmd/api            HTTP server and SMS drain worker
 cmd/seed           development fixtures
 db/migrations      golang-migrate, up/down pairs
 db/queries         SQL, type-checked against the schema by sqlc
 internal/db        generated: models and typed queries
 internal/learning  the engine — knows nothing about HTTP, SMS, or STK
+internal/sms       transport: gateway, rendering, chunking, delivery planning
+internal/inbound   inbound replies → learning events
+internal/outbox    drain worker, retries, backoff
 internal/auth      argon2id hashing, Redis sessions
 internal/httpapi   REST transport
 internal/store     connection pool
@@ -454,8 +466,28 @@ docs/              architecture decisions
 ```
 
 `internal/learning` is the boundary that matters. It accepts a learner action
-and applies it to learner state; it has no transport awareness. Adding SMS means
+and applies it to learner state; it has no transport awareness. Adding SMS meant
 calling `Ingest`, not changing anything in there.
+
+## Trying SMS locally
+
+With no provider account, the log gateway records what would have been sent:
+
+```bash
+SMS_INBOUND_SECRET=local-dev-secret make run
+```
+
+To exercise inbound, point a webhook at `/v1/sms/inbound` with that header set:
+
+```bash
+curl -X POST http://localhost:8080/v1/sms/inbound \
+  -H 'Content-Type: application/json' \
+  -H 'X-Neo-Auth: local-dev-secret' \
+  -d '{"from":"+254700000001","body":"B","message_id":"gw-msg-1"}'
+```
+
+The reply is logged rather than delivered. Send the same `message_id` twice and
+the second is reported as a duplicate and changes nothing.
 
 ## License
 

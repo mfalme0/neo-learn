@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/neolearn/neolearn/internal/auth"
 	"github.com/neolearn/neolearn/internal/config"
 	"github.com/neolearn/neolearn/internal/db"
+	"github.com/neolearn/neolearn/internal/inbound"
 	"github.com/neolearn/neolearn/internal/learning"
 )
 
@@ -23,6 +25,28 @@ type Server struct {
 	sessions *auth.SessionStore
 	learning *learning.Service
 	hasher   auth.HashParams
+
+	// inbound processes messages delivered by the SMS provider. Nil when SMS is
+	// not configured, in which case the webhook route is not mounted at all.
+	inbound     *inbound.Processor
+	inboundAuth *InboundAuth
+	// acknowledge enqueues an SMS reply for delivery. Nil means replies are
+	// computed but not queued.
+	acknowledge func(context.Context, inbound.Acknowledgement) error
+	realIP      func(*http.Request) string
+}
+
+// Options carries optional dependencies so a deployment without SMS does not
+// have to construct a gateway.
+type Options struct {
+	// Inbound processes received messages.
+	Inbound *inbound.Processor
+	// InboundAuth configures webhook authentication.
+	InboundAuth *InboundAuth
+	// Acknowledge enqueues a reply for delivery.
+	Acknowledge func(context.Context, inbound.Acknowledgement) error
+	// TrustedProxies controls who may set X-Forwarded-For.
+	TrustedProxies []string
 }
 
 // NewServer wires a Server.
@@ -31,13 +55,23 @@ func NewServer(
 	queries *db.Queries,
 	sessions *auth.SessionStore,
 	learningService *learning.Service,
+	opts Options,
 ) *Server {
+	authn := opts.InboundAuth
+	if authn == nil {
+		authn = NewInboundAuth("")
+	}
+
 	return &Server{
-		cfg:      cfg,
-		queries:  queries,
-		sessions: sessions,
-		learning: learningService,
-		hasher:   auth.DefaultHashParams(cfg.Argon2.Time, cfg.Argon2.Memory, cfg.Argon2.Threads),
+		cfg:         cfg,
+		queries:     queries,
+		sessions:    sessions,
+		learning:    learningService,
+		hasher:      auth.DefaultHashParams(cfg.Argon2.Time, cfg.Argon2.Memory, cfg.Argon2.Threads),
+		inbound:     opts.Inbound,
+		inboundAuth: authn,
+		acknowledge: opts.Acknowledge,
+		realIP:      RealIP(opts.TrustedProxies),
 	}
 }
 
@@ -50,6 +84,14 @@ func (s *Server) Router() http.Handler {
 	r.Use(AllowWebOrigin(s.cfg.WebOrigin))
 
 	r.Get("/healthz", s.handleHealth)
+
+	// The inbound webhook is mounted only when a secret is configured. With no
+	// secret there is no safe way to authenticate the request, so the route is
+	// absent rather than present-and-rejecting: an unauthenticated write path
+	// should not exist at all.
+	if s.inbound != nil && s.inboundAuth.enabled() {
+		r.Post("/v1/sms/inbound", s.handleInboundSMS)
+	}
 
 	r.Route("/v1", func(r chi.Router) {
 		// Public.

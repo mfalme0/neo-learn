@@ -19,9 +19,39 @@ import (
 	"github.com/neolearn/neolearn/internal/testsupport"
 )
 
+// testServer wraps a running handler with a cookie-carrying client.
+type testServer struct {
+	*httptest.Server
+}
+
+// client returns an http.Client sharing one cookie jar, mirroring how a browser
+// behaves across a multi-step flow.
+func (s *testServer) client() *http.Client {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		panic("cookie jar: " + err.Error())
+	}
+	return &http.Client{
+		Jar:     jar,
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// newTestServer starts a server for the duration of a test.
+func newTestServer(t *testing.T, handler http.Handler) *testServer {
+	t.Helper()
+
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return &testServer{Server: ts}
+}
+
 // harness bundles a running API with the fixture it serves.
 type harness struct {
-	Server  *httptest.Server
+	Server  *testServer
 	Env     *testsupport.Config
 	Fixture testsupport.Fixture
 }
@@ -49,29 +79,16 @@ func newHarness(t *testing.T) *harness {
 	queries := db.New(env.Pool)
 	sessions := auth.NewSessionStore(env.Redis, "session_test:", cfg.Session.TTL)
 
-	server := httpapi.NewServer(cfg, queries, sessions, learning.NewService(env.Pool, queries))
-	ts := httptest.NewServer(server.Router())
-	t.Cleanup(ts.Close)
+	server := httpapi.NewServer(cfg, queries, sessions, learning.NewService(env.Pool, queries), httpapi.Options{})
 
-	return &harness{Server: ts, Env: env, Fixture: fx}
+	return &harness{Server: newTestServer(t, server.Router()), Env: env, Fixture: fx}
 }
 
-// client returns an http.Client carrying the session cookie across requests,
-// mirroring how a browser behaves across a multi-step flow.
+// client returns an http.Client carrying the session cookie across requests.
 func (h *harness) client(t *testing.T) *http.Client {
 	t.Helper()
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("create cookie jar: %v", err)
-	}
-	return &http.Client{
-		Jar:     jar,
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	return h.Server.client()
 }
 
 func (h *harness) login(t *testing.T) *http.Client {

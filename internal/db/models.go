@@ -140,6 +140,50 @@ func (ns NullQuestionKind) Value() (driver.Value, error) {
 	return string(ns.QuestionKind), nil
 }
 
+type SmsConversationState string
+
+const (
+	SmsConversationStateIdle           SmsConversationState = "idle"
+	SmsConversationStateAwaitingAnswer SmsConversationState = "awaiting_answer"
+	SmsConversationStateAwaitingStart  SmsConversationState = "awaiting_start"
+	SmsConversationStateCompleted      SmsConversationState = "completed"
+)
+
+func (e *SmsConversationState) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = SmsConversationState(s)
+	case string:
+		*e = SmsConversationState(s)
+	default:
+		return fmt.Errorf("unsupported scan type for SmsConversationState: %T", src)
+	}
+	return nil
+}
+
+type NullSmsConversationState struct {
+	SmsConversationState SmsConversationState `json:"sms_conversation_state"`
+	Valid                bool                 `json:"valid"` // Valid is true if SmsConversationState is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullSmsConversationState) Scan(value interface{}) error {
+	if value == nil {
+		ns.SmsConversationState, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.SmsConversationState.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullSmsConversationState) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.SmsConversationState), nil
+}
+
 type UserRole string
 
 const (
@@ -278,8 +322,12 @@ type Outbox struct {
 	CreatedAt         time.Time          `json:"created_at"`
 	ClaimedAt         pgtype.Timestamptz `json:"claimed_at"`
 	DeliveredAt       pgtype.Timestamptz `json:"delivered_at"`
+	// Number of delivery attempts. At or above the give-up threshold the row stops being retried and dead_at is set.
 	Attempts          int32              `json:"attempts"`
 	LastError         *string            `json:"last_error"`
+	NextAttemptAt     time.Time          `json:"next_attempt_at"`
+	DeadAt            pgtype.Timestamptz `json:"dead_at"`
+	ProviderMessageID *string            `json:"provider_message_id"`
 }
 
 type Progress struct {
@@ -320,6 +368,23 @@ type Session struct {
 	LastSeenAt    time.Time          `json:"last_seen_at"`
 	ExpiresAt     time.Time          `json:"expires_at"`
 	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
+}
+
+// Transport state for SMS. Holds what was asked, not what was answered -- answers live in learning_events.
+type SmsConversation struct {
+	ID                  int64                `json:"id"`
+	InstitutionID       int64                `json:"institution_id"`
+	LearnerID           int64                `json:"learner_id"`
+	State               SmsConversationState `json:"state"`
+	PendingAssessmentID *int64               `json:"pending_assessment_id"`
+	PendingQuestionID   *int64               `json:"pending_question_id"`
+	PendingLessonID     *int64               `json:"pending_lesson_id"`
+	PendingPosition     int32                `json:"pending_position"`
+	PendingTotal        int32                `json:"pending_total"`
+	OptedOut            bool                 `json:"opted_out"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
+	LastMessageAt       pgtype.Timestamptz   `json:"last_message_at"`
 }
 
 type User struct {

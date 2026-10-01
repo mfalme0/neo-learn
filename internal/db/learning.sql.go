@@ -449,6 +449,30 @@ func (q *Queries) IsEnrolled(ctx context.Context, arg IsEnrolledParams) (bool, e
 	return exists, err
 }
 
+const learningEventExists = `-- name: LearningEventExists :one
+SELECT EXISTS (
+    SELECT 1
+    FROM learning_events
+    WHERE event_id = $1
+)
+`
+
+// Whether an event id has already been recorded.
+//
+// Checked at the very start of inbound handling. The event id is derived from
+// the provider's message id, so this identifies a gateway retry before any
+// routing happens.
+//
+// It matters that the check comes first: by the time a retry is routed, the
+// conversation may have advanced or closed, and routing a retry against stale
+// state produces a confusing reply rather than a silent success.
+func (q *Queries) LearningEventExists(ctx context.Context, eventID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, learningEventExists, eventID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const upsertLessonProgress = `-- name: UpsertLessonProgress :one
 INSERT INTO progress (
     institution_id,
